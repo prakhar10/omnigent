@@ -108,6 +108,21 @@ _QUEUE_MAX_RECORDS = 10_000
 _TOKEN_REFRESH_SKEW_S = 300.0
 _HTTP_TIMEOUT_S = 10.0
 _SECRET_COMMAND_TIMEOUT_S = 30.0
+# At shutdown, don't start a request with less time than this left.
+_MIN_POST_BUDGET_S = 0.1
+# Transport errors raised before the request was fully sent, so a retry can't
+# duplicate it. Any other transport error (e.g. a read timeout) may mean the
+# insert already landed, so the batch is dropped rather than resent.
+_NOT_SENT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+    httpx.LocalProtocolError,
+)
 # Logger-name prefixes the sink drops as noise: httpx/httpcore emit an
 # "HTTP Request: …" line per call — high-volume plumbing the debug view doesn't
 # want (and the sink's own uploads go through httpx).
@@ -623,11 +638,21 @@ class _TokenSource:
         self._expires_at = 0.0
         self._client_secret = config.client_secret
 
-    def token(self) -> str | None:
+    def token(self, *, deadline: float | None = None) -> str | None:
+        """Return a cached token or mint one.
+
+        With a monotonic shutdown *deadline*, the mint's HTTP call is bounded
+        by it, and an unresolved client-secret command (an unbounded
+        subprocess) is not run.
+        """
         with self._lock:
             if self._token and time.time() < self._expires_at - _TOKEN_REFRESH_SKEW_S:
                 return self._token
-            minted = self._mint()
+            if deadline is not None and (
+                self._client_secret is None and self._config.client_secret_command is not None
+            ):
+                return None
+            minted = self._mint(deadline=deadline)
             if minted is None:
                 return None
             self._token, self._expires_at = minted
@@ -699,7 +724,7 @@ class _TokenSource:
             ]
         )
 
-    def _mint(self) -> tuple[str, float] | None:
+    def _mint(self, *, deadline: float | None = None) -> tuple[str, float] | None:
         client_secret = self._resolve_client_secret()
         if client_secret is None:
             return None
@@ -714,7 +739,7 @@ class _TokenSource:
                     "resource": resource,
                     "authorization_details": self._authorization_details(),
                 },
-                timeout=_HTTP_TIMEOUT_S,
+                timeout=_bounded_timeout(deadline),
             )
         except httpx.HTTPError as exc:
             _diag(
@@ -759,6 +784,23 @@ DebugLogSend = Callable[[list[DebugLogRow]], None]
 _CLOSE_WAKEUP: DebugLogRow = {}
 
 
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _bounded_timeout(deadline: float | None) -> float:
+    """The HTTP timeout, cut to what is left before *deadline*."""
+    remaining = _remaining(deadline)
+    if remaining is None:
+        return _HTTP_TIMEOUT_S
+    return max(0.01, min(_HTTP_TIMEOUT_S, remaining))
+
+
+def _bounded_sleep(seconds: float, deadline: float | None) -> None:
+    remaining = _remaining(deadline)
+    time.sleep(seconds if remaining is None else max(0.0, min(seconds, remaining)))
+
+
 class DebugLogHandler(logging.Handler):
     """Non-blocking handler that queues rows and sends them in batches.
 
@@ -786,6 +828,8 @@ class DebugLogHandler(logging.Handler):
         """
         self._queue: queue.Queue[DebugLogRow] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
         self._stop = threading.Event()
+        # Set by close(): the shutdown drain (and every request it makes) ends by then.
+        self._drain_deadline: float | None = None
         self._thread = threading.Thread(target=self._run, name="omnigent-debug-log", daemon=True)
         self._thread.start()
 
@@ -843,14 +887,24 @@ class DebugLogHandler(logging.Handler):
                     # self-heal only revives a *stopped* thread, so a crash would
                     # silently end delivery for the process. Drop and continue.
                     time.sleep(0.1)
-            # Best-effort drain of everything left on shutdown, batch by batch;
-            # close()'s join timeout bounds how long this may run.
+            # Best-effort drain of everything left on shutdown, batch by batch,
+            # until close()'s deadline; what's left then is dropped and counted.
+            deadline = self._drain_deadline
             while remaining := self._collect_batch(0.0):
+                left = _remaining(deadline)
+                if left is not None and left < _MIN_POST_BUDGET_S:
+                    dropped = len(remaining)
+                    while rest := self._collect_batch(0.0):
+                        dropped += len(rest)
+                    _diag("close_dropped", "shutdown deadline passed; dropped %d row(s)", dropped)
+                    break
                 self._send(remaining)
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
 
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
+    # Set per worker by close(); None outside the shutdown drain.
+    _drain_deadline: float | None = None
 
     def _collect_batch(self, wait: float) -> list[DebugLogRow]:
         batch: list[DebugLogRow] = []
@@ -873,6 +927,8 @@ class DebugLogHandler(logging.Handler):
         """Stop the sender thread after it drains queued rows.
 
         :param timeout: Max seconds to wait for the final drain, e.g. ``5.0``.
+            The drain's uploads are bounded by the same deadline; rows not
+            sent by then are dropped with one diagnostic.
         """
         if self._closed:
             return
@@ -880,6 +936,7 @@ class DebugLogHandler(logging.Handler):
         # handler during the join and replace self._stop/self._thread.
         stop, thread = self._stop, self._thread
         self._closed = True
+        self._drain_deadline = time.monotonic() + timeout
         stop.set()
         # Wake a worker blocked waiting for rows so the timeout is spent on the
         # drain, not on the idle wait. A full queue means it is not blocked.
@@ -915,12 +972,22 @@ class ZerobusLogHandler(DebugLogHandler):
                 client.close()
 
     def _post(self, batch: list[DebugLogRow]) -> None:
+        """POST *batch*, retrying only while ZeroBus cannot have accepted it.
+
+        During the shutdown drain every request, retry and backoff sleep fits
+        before close()'s deadline.
+        """
         payload = json.dumps(batch)
+        deadline = self._drain_deadline
         for attempt in range(3):
-            token = self._tokens.token()
+            token = self._tokens.token(deadline=deadline)
             if not token:
                 # Mint failed — _mint already logged why; note the data loss.
                 _diag("no_token", "no auth token (mint failing); dropping %d row(s)", len(batch))
+                return
+            left = _remaining(deadline)
+            if left is not None and left < _MIN_POST_BUDGET_S:
+                _diag("close_dropped", "shutdown deadline passed; dropped %d row(s)", len(batch))
                 return
             try:
                 response = self._client.post(
@@ -930,14 +997,22 @@ class ZerobusLogHandler(DebugLogHandler):
                         "Content-Type": "application/json",
                     },
                     content=payload,
-                    timeout=_HTTP_TIMEOUT_S,
+                    timeout=_bounded_timeout(deadline),
                 )
-            except httpx.HTTPError as exc:
+            except _NOT_SENT_ERRORS as exc:
                 _diag(
                     "post_transport", "insert POST to %s failed: %s", self._config.insert_url, exc
                 )
-                time.sleep(min(0.5 * 2**attempt, 3.0))
+                _bounded_sleep(min(0.5 * 2**attempt, 3.0), deadline)
                 continue
+            except httpx.HTTPError as exc:
+                _diag(
+                    "post_unknown",
+                    "insert POST outcome unknown (%s); dropped %d row(s) to avoid duplicates",
+                    exc,
+                    len(batch),
+                )
+                return
             if response.status_code == 200:
                 if not self._delivered_any:
                     self._delivered_any = True
@@ -963,7 +1038,7 @@ class ZerobusLogHandler(DebugLogHandler):
                 response.status_code,
                 _body_snippet(response),
             )
-            time.sleep(min(0.5 * 2**attempt, 3.0))
+            _bounded_sleep(min(0.5 * 2**attempt, 3.0), deadline)
         _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
 
 

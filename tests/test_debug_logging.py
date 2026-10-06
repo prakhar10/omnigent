@@ -1301,3 +1301,142 @@ def test_close_wakes_idle_worker_promptly() -> None:
     started = time.monotonic()
     sink.close(timeout=5.0)
     assert time.monotonic() - started < dl._FLUSH_INTERVAL_S / 2
+
+
+# ── bounded shutdown drain ──────────────────────────────────────────────────
+
+
+def test_close_drain_stops_at_the_deadline_and_counts_the_rest(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slow endpoint can't stretch close(); unsent rows are dropped and counted."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def slow_send(batch: list[dl.DebugLogRow]) -> None:
+        gate.wait(timeout=5)
+        time.sleep(0.2)
+        delivered.extend(str(row["message"]) for row in batch)
+
+    sink = dl.DebugLogHandler("runner", slow_send)
+    logger = _sink_logger("test.debug_logging.bounded", sink)
+    try:
+        for i in range(500):
+            logger.info("row %d", i)
+        gate.set()
+        started = time.monotonic()
+        sink.close(timeout=0.5)
+        elapsed = time.monotonic() - started
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)  # let a batch already being sent finish
+
+    assert elapsed < 0.9
+    (drop,) = [r for r in caplog.records if "shutdown deadline passed" in r.getMessage()]
+    dropped = int(drop.getMessage().split("dropped ")[1].split(" ")[0])
+    assert 0 < len(delivered) < 500
+    assert len(delivered) + dropped == 500  # nothing both sent and dropped
+
+
+class _FakeZerobus:
+    """Fake httpx client: mints a token, answers inserts from a script."""
+
+    def __init__(self, outcomes: list[object], *, mint_delay: float = 0.0) -> None:
+        self._outcomes = outcomes
+        self._mint_delay = mint_delay
+        self.inserts = 0
+        self.insert_timeouts: list[float] = []
+
+    def post(self, url: str, **kwargs: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            time.sleep(self._mint_delay)
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        self.inserts += 1
+        self.insert_timeouts.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+        outcome = self._outcomes[min(self.inserts, len(self._outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, int)
+        return httpx.Response(outcome)
+
+
+def _bare_zerobus_sink(client: _FakeZerobus) -> dl.ZerobusLogHandler:
+    config = dl.config_from_env()
+    assert config is not None
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+    return sink
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "inserts"),
+    [
+        # The insert may have landed: resending could duplicate it.
+        ([httpx.ReadTimeout("slow")], 1),
+        ([httpx.RemoteProtocolError("reset")], 1),
+        # Never sent: safe to retry.
+        ([httpx.ConnectError("offline")], 3),
+        ([httpx.ConnectError("blip"), 200], 2),
+    ],
+)
+def test_post_retries_only_requests_that_cannot_have_landed(
+    _configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[object],
+    inserts: int,
+) -> None:
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    client = _FakeZerobus(outcomes)
+    _bare_zerobus_sink(client)._post([{"message": "m"}])
+    assert client.inserts == inserts
+
+
+def test_post_during_the_drain_fits_the_deadline(_configured_env: None) -> None:
+    client = _FakeZerobus([200])
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + 0.5
+
+    sink._post([{"message": "m"}])
+
+    assert client.inserts == 1
+    assert 0 < client.insert_timeouts[0] <= 0.5
+
+
+@pytest.mark.parametrize(
+    ("budget", "mint_delay"),
+    [(-1.0, 0.0), (0.25, 0.2)],
+    ids=["spent-deadline", "mint-uses-up-the-budget"],
+)
+def test_post_sends_nothing_without_time_left(
+    _configured_env: None, budget: float, mint_delay: float
+) -> None:
+    client = _FakeZerobus([200], mint_delay=mint_delay)
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + budget
+
+    sink._post([{"message": "m"}])
+
+    assert client.inserts == 0
+
+
+def test_shutdown_mint_never_runs_an_unresolved_secret_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The secret command is an unbounded subprocess; never run it at shutdown."""
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    config = dl.config_from_env()
+    assert config is not None
+    ran: list[object] = []
+    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **_k: ran.append(a))
+    tokens = dl._TokenSource(config, _FakeZerobus([200]))  # type: ignore[arg-type]
+
+    assert tokens.token(deadline=time.monotonic() + 1) is None
+    assert ran == []
